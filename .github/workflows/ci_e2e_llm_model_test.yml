@@ -39,11 +39,11 @@ jobs:
     env:
       VENV_DIR: ${{ github.workspace }}/.venv
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: "Setting up Python"
         id: setup_python
-        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{matrix.version}}
       - name: Create Python venv
@@ -102,7 +102,7 @@ jobs:
 
       - name: Upload log files
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: llama-logs
           path: |
@@ -123,14 +123,14 @@ jobs:
     runs-on: linux-mi325-1gpu-ossci-nod-ai
     steps:
     - name: Download log artifacts
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: llama-logs
         path: logs
 
     - name: Checkout Target Repo
       if: always()
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         repository: nod-ai/amd-shark-ai-reports
         token: ${{ secrets.AMD_SHARK_AI_GITHUB_TOKEN }}
