@@ -1,0 +1,50 @@
+# Visual Studio files
+.env
+.vs/
+.vscode/
+*.sdf
+*.opensdf
+*.VC.opendb
+*.suo
+*.user
+
+# Common IREE source/build paths
+iree/
+iree-build/
+
+# macOS files
+.DS_Store
+
+# CMake artifacts
+build/
+build-*/
+_build/
+
+# Python
+__pycache__
+_python_build/
+deps/
+dist/
+wheelhouse
+*.egg-info
+*.whl
+*.venv
+
+# Local-only config options
+version_local.json
+
+# Model artifacts
+*.pt
+*.safetensors
+*.gguf
+*.vmfb
+genfiles/
+export/
+*.zip
+tmp/
+
+# Known inference result blobs
+*output*.png
+
+# Log files.
+*.log

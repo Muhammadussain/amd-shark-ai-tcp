@@ -1,0 +1,99 @@
+# SDXL Server and CLI
+
+This directory contains a [SDXL](https://stablediffusionxl.com/) inference server, CLI and support components. More information about SDXL on [huggingface](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0).
+
+## Install
+
+For [nightly releases](../../../../docs/nightly_releases.md)
+For our [stable release](../../../../docs/user_guide.md)
+
+### Other requirements to run SDXL server
+```
+pip install certifi
+pip install diffusers
+```
+
+## Start SDXL Server
+The server will prepare runtime artifacts for you.
+
+By default, the port is set to 8000. If you would like to change this, use `--port` in each of the following commands.
+
+You can check if this (or any) port is in use on Linux with `ss -ntl | grep 8000`.
+
+```
+python -m shortfin_apps.sd.server --device=hip --device_ids=0 --build_preference=precompiled
+```
+ - Wait until your server outputs:
+```
+INFO - Application startup complete.
+INFO - Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+> [!NOTE]
+> - Server command mentioned above will use the pre-compiled version of artifacts and start the server. To export the MLIR and compile the new MLIR, user can use option `--build_preference=export --force_update=True`
+> - MLIR and IRPA files gets exported in `.cache` directory in user's home directory e.g. `/home/<username>/.cache/amdshark/genfiles/sdxl/`
+> - VMFB gets compiled at  `/home/<username>/.cache/amdshark/bin/sdxl/`
+
+To export and compile MLIR for individual components, one can refer following commands
+```
+python -m iree.build /home/<username>/scratch/mlperf/sdxl/sanity_test/3.12.venv/lib/python3.12/site-packages/shortfin_apps/sd/components/builders.py --model-json=/home/<username>/.cache/amdshark/genfiles/sdxlconfig/sdxl_config_i8.json --target=gfx942 --splat=False --build-preference=export --output-dir=/home/<username>/.cache/amdshark --model=clip --force-update=False --iree-hal-target-device=hip --iree-rocm-target=gfx942 --iree-compile-extra-args= --force-update=True
+
+python -m iree.build /home/<username>/scratch/mlperf/sdxl/sanity_test/3.12.venv/lib/python3.12/site-packages/shortfin_apps/sd/components/builders.py --model-json=/home/<username>/.cache/amdshark/genfiles/sdxlconfig/sdxl_config_i8.json --target=gfx942 --splat=False --build-preference=export --output-dir=/home/<username>/.cache/amdshark --model=unet --force-update=False --iree-hal-target-device=hip --iree-rocm-target=gfx942 --iree-compile-extra-args= --force-update=True
+
+python -m iree.build /home/<username>/scratch/mlperf/sdxl/sanity_test/3.12.venv/lib/python3.12/site-packages/shortfin_apps/sd/components/builders.py --model-json=/home/<username>/.cache/amdshark/genfiles/sdxlconfig/sdxl_config_i8.json --target=gfx942 --splat=False --build-preference=export --output-dir=/home/<username>/.cache/amdshark --model=vae --force-update=False --iree-hal-target-device=hip --iree-rocm-target=gfx942 --iree-compile-extra-args= --force-update=True
+
+python -m iree.build /home/<username>/scratch/mlperf/sdxl/sanity_test/3.12.venv/lib/python3.12/site-packages/shortfin_apps/sd/components/builders.py --model-json=/home/<username>/.cache/amdshark/genfiles/sdxlconfig/sdxl_config_i8.json --target=gfx942 --splat=False --build-preference=export --output-dir=/home/<username>/.cache/amdshark --model=scheduler --force-update=False --iree-hal-target-device=hip --iree-rocm-target=gfx942 --iree-compile-extra-args= --force-update=True
+```
+
+### Run the SDXL Client
+
+```
+python -m shortfin_apps.sd.simple_client --interactive
+```
+
+Congratulations!!! At this point you can play around with the server and client based on your usage.
+
+### Note: Server implementation scope
+
+The SDXL server's implementation does not account for extremely large client batches. Normally, for heavy workloads, services would be composed under a load balancer to ensure each service is fed with requests optimally. For most cases outside of large-scale deployments, the server's internal batching/load balancing is sufficient.
+
+### Update flags
+
+Please see --help for both the server and client for usage instructions. Here's a quick snapshot.
+
+#### Update server options:
+
+| Flags | options |
+|---|---|
+|--host HOST |
+|--port PORT | server port |
+|--root-path ROOT_PATH |
+|--timeout-keep-alive |
+|--device | local-task,hip,amdgpu |
+|--target | gfx942, gfx1100, gfx1201 | gfx942 only supported in this release
+|--device_ids |
+|--tokenizers |
+|--model_config |
+| --workers_per_device |
+| --fibers_per_device |
+| --isolation |	per_fiber, per_call, none |
+| --show_progress  |
+| --trace_execution |
+| --amdgpu_async_allocations |
+| --splat   |
+| --build_preference | compile,precompiled |
+| --compile_flags |
+| --flagfile FLAGFILE |
+| --artifacts_dir ARTIFACTS_DIR | Where to store cached artifacts from the Cloud |
+
+#### Update client with different options:
+
+| Flags |options|
+|---|---
+|--file |
+|--reps |
+|--save | Whether to save image generated by the server |
+|--outputdir| output directory to store images generated by SDXL |
+|--steps |
+|--interactive |
+|--port| port to interact with server |

@@ -1,0 +1,29 @@
+# Pytest plugins
+pytest==8.3.5
+pytest-asyncio
+pytest-subtests
+pytest-timeout
+pytest-cov
+pytest-xdist==3.8.0
+
+# General server libraries
+requests
+fastapi
+aiohttp==3.11.3
+onnx
+uvicorn
+scikit-image
+
+# Libraries needed to build in dev setups.
+setuptools>=77.0.3
+wheel
+
+# Deps needed for shortfin_apps.llm
+dataclasses-json
+tokenizers>=0.13.0
+huggingface_hub[cli]
+sentencepiece
+
+# Deps needed for shortfin_apps.sd
+pillow
+transformers>=4.30.0

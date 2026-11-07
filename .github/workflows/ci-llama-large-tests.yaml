@@ -1,0 +1,88 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: Llama Benchmarking Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekdays at 11:00 AM UTC = 03:00 AM PST / 04:00 AM PDT
+    - cron: "0 11 * * 0-6"
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test_llama_large:
+    if: ${{ github.repository_owner == 'nod-ai' || github.event_name != 'schedule' }}
+    timeout-minutes: 240
+    name: "Llama Benchmarking Tests"
+    strategy:
+      matrix:
+        python-version: [3.11]
+      fail-fast: false
+    runs-on: linux-mi325-1gpu-ossci-nod-ai
+    defaults:
+      run:
+        shell: bash
+    env:
+      VENV_DIR: ${{ github.workspace }}/.venv
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Get Current Date
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+
+      - name: "Setting up Python"
+        id: setup_python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: ${{matrix.python-version}}
+      - name: Create Python venv
+        run: python -m venv ${VENV_DIR}
+
+      - name: Install pip deps
+        run: |
+          source ${VENV_DIR}/bin/activate
+          amdsharktank/build_tools/install_test_dependencies.sh \
+            --iree-unpinned
+          pip freeze
+
+      - name: Run llama tests
+        run: |
+          source ${VENV_DIR}/bin/activate
+          pytest amdsharktank/tests/models/llama/benchmark_amdgpu_test.py \
+            -v -s \
+            --run-nightly-test \
+            --iree-rocm-target=gfx942 \
+            --iree-device=hip://0 \
+            --iree-hal-target-device=hip \
+            --llama3-8b-f16-model-path="/amdshark-dev/8b/instruct/weights/llama3.1_8b_instruct_fp16.irpa" \
+            --llama3-8b-f8-model-path="/amdshark-dev/8b/fp8/native_fp8_e4m3fnuz_llama3_8b.irpa" \
+            --llama3-8b-f8-attnf8-model-path="/amdshark-dev/8b/fp8/attnf8/native_fp8_e4m3fnuz_llama3_8b.irpa" \
+            --llama3-70b-f16-model-path="/amdshark-dev/70b/instruct/weights/llama3.1_70b_instruct_fp16.irpa" \
+            --llama3-70b-f8-model-path="/amdshark-dev/70b/fp8/llama70b_fp8.irpa" \
+            --html=out/llm/llama/benchmark/index.html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.AMD_SHARK_AI_GITHUB_TOKEN }}
+          publish_dir: ./out/llm/llama/benchmark
+          destination_dir: ./llm/llama/benchmark
+          keep_files: true
+
+      - name: Upload llama executable files
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: llama-files
+          path: ${{ github.workspace }}/${{ steps.date.outputs.date }}

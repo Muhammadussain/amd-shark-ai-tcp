@@ -1,0 +1,621 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+import logging
+from collections.abc import Sequence
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from types import TracebackType
+from typing import Generic, Optional, Any, Callable, Protocol, TypeVar
+from abc import ABC, abstractmethod
+import os
+import time
+import z3  # type: ignore
+import subprocess
+import tempfile
+
+from iree.compiler import ir  # type: ignore
+from iree.compiler.dialects import iree_codegen, iree_gpu, linalg, transform  # type: ignore
+import iree.compiler as ireec  # type: ignore
+from iree.compiler._mlir_libs._mlir import ir  # type: ignore
+
+
+class CommonTypes:
+    def __init__(self, ctx: ir.Context):
+        assert ctx
+        self.i1 = ir.IntegerType.get_signless(1, ctx)
+        self.i8 = ir.IntegerType.get_signless(8, ctx)
+        self.i16 = ir.IntegerType.get_signless(16, ctx)
+        self.i32 = ir.IntegerType.get_signless(32, ctx)
+        self.i64 = ir.IntegerType.get_signless(64, ctx)
+
+        self.f8E4M3FNUZ = ir.Float8E4M3FNUZType.get(ctx)
+        self.f8E5M2FNUZ = ir.Float8E5M2FNUZType.get(ctx)
+        self.f16 = ir.F16Type.get(ctx)
+        self.f32 = ir.F32Type.get(ctx)
+
+        self.bf16 = ir.BF16Type.get(ctx)
+
+    def getI64(self, value: int) -> ir.IntegerAttr:
+        return ir.IntegerAttr.get(self.i64, value)
+
+    def getI64ArrayAttr(self, values: list[int]) -> ir.ArrayAttr:
+        return ir.ArrayAttr.get([self.getI64(x) for x in values])
+
+
+class BenchmarkToolConfig(Protocol):
+    """Marker base class for benchmark tool configuration objects."""
+
+    benchmark_fn: Callable
+
+
+@dataclass
+class ConvDimInfo:
+    """Common convolution dimension info extracted from a convolution op.
+
+    This dataclass is reused by all convolution parsers to share the common
+    dimension extraction logic.
+    """
+
+    convolution_dims: linalg.ConvolutionDimensions
+    indexing_maps: list[ir.AffineMap]
+    lhs_type: ir.Type
+    rhs_type: ir.Type
+    res_type: ir.Type
+    batch_indices: list[int]
+    output_image_indices: list[int]
+    output_channel_indices: list[int]
+    filter_loop_indices: list[int]
+    input_channel_indices: list[int]
+    depth_indices: list[int]
+    strides: list[int]
+    dilations: list[int]
+    batch_sizes: list[int]
+    output_image_sizes: list[int]
+    output_channel_sizes: list[int]
+    filter_loop_sizes: list[int]
+    input_channel_sizes: list[int]
+    depth_sizes: list[int]
+
+
+class TunerContext:
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        self.mlir_ctx: ir.Context = ir.Context()
+        self.logger: logging.Logger = logger or logging.getLogger("tune")
+        self.type: CommonTypes = CommonTypes(self.mlir_ctx)
+
+    def __enter__(self) -> "TunerContext":
+        self.mlir_ctx.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        return self.mlir_ctx.__exit__(exc_type, exc_value, traceback)
+
+
+@dataclass
+class TimeBudget:
+    """Wall-clock deadline helper based on time.monotonic()."""
+
+    deadline: Optional[float] = None  # Absolute monotonic time (seconds).
+
+    @classmethod
+    def for_minutes(cls, minutes: Optional[float], now: Optional[float] = None):
+        """Create a budget that lasts 'minutes' from a given 'now' (monotonic seconds)."""
+        if minutes is None or minutes <= 0:
+            return None
+        if now is None:
+            now = time.monotonic()
+        return cls(now + (minutes * 60.0))
+
+    def expired(self, current_time: Optional[float] = None) -> bool:
+        if current_time is None:
+            current_time = time.monotonic()
+        return self.deadline is not None and current_time >= self.deadline
+
+    def remaining(self, current_time: Optional[float] = None) -> Optional[float]:
+        if current_time is None:
+            current_time = time.monotonic()
+        if self.deadline is None:
+            return None
+        return max(0.0, self.deadline - current_time)
+
+
+@dataclass
+class KnobAssignment(ABC):
+    """A KnobAssignment is a record of tuning parameters values from constraint_generator"""
+
+    def get_knobs(self) -> dict:
+        """Return a dict of all knob parameters and their assigned values."""
+        return asdict(self)
+
+
+@dataclass
+class TuningConfiguration:
+    """
+    A TuningConfiguration contains an attribute that will be set on an op as a
+    result of running a tuning spec, along with its name. For example, a common
+    tuning configuration would have "compilation_info" as its name, and an
+    `iree_codegen.CompilationInfoAttr` as the configuration.
+
+    Example:
+        TuningConfiguration(name="compilation_info", configuration=CompilationInfoAttr(...))
+    """
+
+    name: str
+    configuration: ir.Attribute
+    knob_assignment: Optional[KnobAssignment] = None
+
+
+class DispatchKind(Enum):
+    conv = 0
+    contraction = 1
+    attention = 2
+
+
+@dataclass
+class ShapedType:
+    shape: list[int]
+    element_type: ir.IntegerType | ir.FloatType
+
+    def rank(self) -> int:
+        return len(self.shape)
+
+    @property
+    def bitwidth(self) -> int:
+        return self.element_type.width
+
+    def __str__(self) -> str:
+        dim_to_str = lambda dim: str(dim) if dim != -1 else "?"
+        return "x".join(map(dim_to_str, self.shape)) + "x" + str(self.element_type)
+
+
+@dataclass
+class ContractionSizes:
+    """
+    Represents the size of the iteration space along each contraction dimension.
+    For example, the following is a simple batch mmt:
+      linalg.generic ... indexing_maps = [
+          affine_map<(b, m, n, k) -> (b, m, k)>,
+          affine_map<(b, m, n, k) -> (b, n, k)>,
+          affine_map<(b, m, n, k) -> (b, m, n)>,
+        ] ...
+        ins(%lhs: tensor<4x8x32xf16>, %rhs: tensor<4x16x32xf16>)
+        outs(%acc: tensor<4x8x16xf16>)
+    The ContractionSizes would be:
+      M = [8]
+      N = [16]
+      K = [32]
+      B = [4]
+    """
+
+    M: list[int]
+    N: list[int]
+    K: list[int]
+    B: list[int] = field(default_factory=list)
+
+
+@dataclass
+class ContractionDimensions:
+    """
+    Stores which dimensions of the iteration space belong to M, N, K, or Batch.
+    For example, the following is a simple batch mmt:
+    linalg.generic ... indexing_maps = [
+        affine_map<(b, m, n, k) -> (b, m, k)>,
+        affine_map<(b, m, n, k) -> (b, n, k)>,
+        affine_map<(b, m, n, k) -> (b, m, n)>,
+        ]
+    The ContractionDimensions would be:
+    M = [1]
+    N = [2]
+    K = [3]
+    B = [0]
+    """
+
+    m: list[int]
+    n: list[int]
+    k: list[int]
+    batch: list[int] = field(default_factory=list)
+
+
+@dataclass
+class MatmulShapeType:
+    m: int
+    n: int
+    k: int
+    lhs_type: ir.IntegerType | ir.FloatType
+    rhs_type: ir.IntegerType | ir.FloatType
+    acc_type: ir.IntegerType | ir.FloatType
+
+
+def is_affine_expr_function_of_dim(expr: ir.AffineExpr, position: int) -> bool:
+    """
+    Return True if the expression depends on the dimension at the given position.
+
+    Examples:
+        d0 -> True for position 0, False for position 1.
+        d0 + d1 -> True for both position 0 and position 1.
+        d1 * 2 -> False for position 0, True for position 1.
+        42 (constant) -> False for any position.
+    """
+    if isinstance(expr, ir.AffineDimExpr):
+        return expr.position == position
+
+    # Check if it's a binary operation and recursively check both sides.
+    if isinstance(expr, ir.AffineBinaryExpr):
+        return is_affine_expr_function_of_dim(
+            expr.lhs, position
+        ) or is_affine_expr_function_of_dim(expr.rhs, position)
+
+    return False
+
+
+def get_map_result_dim_positions(map: ir.AffineMap) -> Optional[list[int]]:
+    if not map.is_projected_permutation:
+        return None
+
+    return [ir.AffineDimExpr(expr).position for expr in map.results]
+
+
+def is_result_type_compatible_with_accumulator(
+    a_type: ir.Type,
+    b_type: ir.Type,
+    c_type: ir.Type,
+    res_type: ir.Type,
+) -> bool:
+    """Check if a result element type is compatible with the MMA accumulator type.
+
+    For bf16/f16 inputs with f32 accumulator, the hardware can cast, so we
+    allow either the input precision or f32 as the result type. Otherwise
+    the result type must match the accumulator type exactly.
+    """
+    if (
+        isinstance(a_type, ir.BF16Type)
+        and isinstance(b_type, ir.BF16Type)
+        and isinstance(c_type, ir.F32Type)
+    ):
+        return isinstance(res_type, (ir.BF16Type, ir.F32Type))
+
+    if (
+        isinstance(a_type, ir.F16Type)
+        and isinstance(b_type, ir.F16Type)
+        and isinstance(c_type, ir.F32Type)
+    ):
+        return isinstance(res_type, (ir.F16Type, ir.F32Type))
+
+    return res_type == c_type
+
+
+# The key name for GPUPipelineOptionsAttr in the translation info config dictionary.
+GPU_PIPELINE_OPTIONS_KEY = "gpu_pipeline_options"
+# The key name for llvm_func_attrs attribute in the translation info config dictionary.
+LLVM_FUNC_ATTRS_KEY = "llvm_func_attrs"
+DENORMAL_FP_MATH_F32_KEY = "iree_codegen.denormal_fp_math_f32"
+
+
+def get_lowering_config(
+    tuner_ctx: TunerContext,
+    **kwargs: Any,
+) -> iree_gpu.LoweringConfigAttr:
+    lowering_config_dict: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        # A local variable to hold the transformed value.
+        promoted_value = value
+        match key:
+            case "workgroup" | "reduction" | "subgroup" | "promote_operands" | "padding" | "padding_conv":
+                if isinstance(value, Sequence):
+                    promoted_value = ir.ArrayAttr.get(
+                        [tuner_ctx.type.getI64(x) for x in value]
+                    )
+                elif not isinstance(value, ir.ArrayAttr):
+                    assert (
+                        False
+                    ), f"Unsupported type for key '{key}': {type(value).__name__}"
+            case "subgroup_basis":
+                if isinstance(value, list) and len(value) == 2:
+                    counts, mapping = value
+                    assert isinstance(counts, list) and isinstance(
+                        mapping, list
+                    ), f"subgroup_basis must contain two lists [counts, mapping]"
+                    counts_attr = tuner_ctx.type.getI64ArrayAttr(counts)
+                    mapping_attr = tuner_ctx.type.getI64ArrayAttr(mapping)
+                    promoted_value = ir.ArrayAttr.get([counts_attr, mapping_attr])
+
+                else:
+                    assert (
+                        False
+                    ), f"Unsupported type for key '{key}': {type(value).__name__}"
+            case "mma_kind":
+                if not isinstance(value, (iree_gpu.MMAAttr, iree_gpu.VirtualMMAAttr)):
+                    assert (
+                        False
+                    ), f"Unsupported type for key '{key}': {type(value).__name__}"
+            case _:
+                assert False, f"Unhandled key in lowering configuration: {key}"
+
+        lowering_config_dict[key] = promoted_value
+    lowering_config_attrs = ir.DictAttr.get(lowering_config_dict)
+    return iree_gpu.LoweringConfigAttr.get(lowering_config_attrs)
+
+
+def combine_tuning_specs(
+    tuner_ctx: TunerContext, td_specs: list[ir.Module]
+) -> ir.Module:
+    """
+    Puts multiple input modules `td_specs` into a single top-level container module.
+    This function does *not* attempt to merge or link `td_specs` across modules.
+    """
+    with tuner_ctx.mlir_ctx as ctx, ir.Location.unknown():
+        top_module = ir.Module.create()
+        top_module.operation.attributes[
+            "transform.with_named_sequence"
+        ] = ir.UnitAttr.get()
+
+        for td_spec in td_specs:
+            top_module.body.append(td_spec.operation.clone())
+        return top_module
+
+
+def link_tuning_specs(tuner_ctx: TunerContext, td_specs: list[ir.Module]) -> ir.Module:
+    """
+    Links multiple input modules (`td_specs`) into a single tuning specification module.
+    First, the input modules are combined into a container module. Then, the external
+    `iree-opt` tool is invoked with the `--iree-codegen-link-tuning-specs` pass to
+    link or merge the individual tuning specs. When all input specs are marked with the
+    default attribute `iree_codegen.tuning_spec_with_default_entrypoint`, they are merged
+    into one tuning spec.
+    """
+    module = combine_tuning_specs(tuner_ctx, td_specs)
+    iree_opt: str = ireec.binaries.find_tool("iree-opt")  # type: ignore[attr-defined]
+
+    if len(td_specs) == 1:
+        # avoid unnecessary link overhead.
+        return td_specs[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "tmp_input.mlir")
+        output_path = os.path.join(tmpdir, "tmp_output.mlir")
+
+        with open(input_path, "w") as f:
+            f.write(str(module))
+
+        result = subprocess.run(
+            [
+                iree_opt,
+                "--iree-codegen-link-tuning-specs",
+                input_path,
+                "-o",
+                output_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"iree-opt failed: {result.stderr}")
+
+        with open(output_path, "r") as f:
+            output_mlir = f.read()
+            return ir.Module.parse(output_mlir, tuner_ctx.mlir_ctx)
+
+
+def get_matcher_names_from_td_spec(td_spec: ir.Module) -> set[str]:
+    matcher_names = set()
+
+    for op in td_spec.body.operations:
+        if not isinstance(op, transform.NamedSequenceOp):
+            continue
+        if op.sym_name.value != "__kernel_config":
+            continue
+
+        for inner_op in op.regions[0].blocks[0].operations:
+            if isinstance(inner_op, transform.ForeachMatchOp):
+                for matcher in inner_op.matchers:
+                    matcher_names.add(matcher.value)
+
+    return matcher_names
+
+
+def get_matcher_overlap_info(
+    starter_matchers: set[str], current_matchers: set[str]
+) -> tuple[set[str], set[str]]:
+    """
+    Returns:
+        - overlapping_matchers: matchers shared by starter and current
+        - unique_starter_matchers: matchers only in the starter
+    """
+    overlapping_matchers = starter_matchers & current_matchers
+    unique_starter_matchers = starter_matchers - current_matchers
+
+    return overlapping_matchers, unique_starter_matchers
+
+
+def determine_td_specs_to_link(
+    td_specs: list[ir.Module],
+    log_duplicates: bool = False,
+) -> list[ir.Module]:
+    """
+    Determines which tuning specs should be linked based on matcher overlap.
+
+    Args:
+        td_specs: A list of 1 or 2 tuning spec modules. If two are provided, the first is
+                the candidate spec and the second is the starter spec.
+        log_duplicates: If True, logs a warning for overlapping matchers.
+
+    Returns:
+        A list of td specs to link (possibly excluding the starter spec).
+    """
+
+    assert 1 <= len(td_specs) <= 2, "Expected 1 or 2 td specs (current and starter)"
+
+    if len(td_specs) == 1:
+        # No starter td spec provided, nothing to merge.
+        return td_specs
+
+    current_td_spec, starter_td_spec = td_specs
+
+    current_matchers = get_matcher_names_from_td_spec(current_td_spec)
+    starter_matchers = get_matcher_names_from_td_spec(starter_td_spec)
+
+    overlapping_matchers, unique_starter_matchers = get_matcher_overlap_info(
+        starter_matchers, current_matchers
+    )
+
+    if log_duplicates and overlapping_matchers:
+        logging.warning(
+            f"Operations have already been tuned in the starter tuning spec: {sorted(overlapping_matchers)}"
+        )
+
+    if unique_starter_matchers:
+        return td_specs
+
+    # Starter spec is redundant, so skip merging it.
+    return [current_td_spec]
+
+
+def get_target_info(input_module: ir.Module) -> iree_gpu.TargetInfo:
+    # Get GPU target information from the executable variant operation.
+    variant_op_list = iree_codegen.get_executable_variant_ops(input_module)
+    assert len(variant_op_list) == 1, "Expect one executable variant op"
+    variant_op = variant_op_list[0]
+    executable_variant_op = variant_op.opview
+    target = executable_variant_op.target
+
+    return iree_gpu.TargetInfo.get_gpu_target_info(target)
+
+
+# The following two functions are from IREE side for padding utility:
+# https://github.com/iree-org/iree/blob/8ae91ebb0e555e660b8a6898f6071476f7a1f20b/compiler/src/iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.cpp#L631-L671
+def compute_next_aligned_bound(original_bound: int, alignment: int) -> int:
+    """Pads a bound up to the next multiple of alignment if needed.
+
+    Returns:
+        The original bound if already aligned, or the next multiple of alignment.
+    """
+    remainder = original_bound % alignment
+    if remainder == 0:
+        return original_bound
+    return original_bound + alignment - remainder
+
+
+def get_dim_bounds(
+    dims: list[int],
+    padding_can_be_expensive: bool,
+) -> list[int]:
+    """Computes padded dimension bounds for better tile alignment.
+
+    Returns:
+        List of dimensions, potentially padded to alignment boundaries.
+    """
+    if padding_can_be_expensive:
+        return dims
+
+    # TODO(Bangtian): Make over-padding a tunable parameter. This logic allows over-padding to get larger
+    # tile sizes, which may result in better performance despite doing more padded computation.
+    result = []
+    for dim in dims:
+        if dim > 128:
+            result.append(compute_next_aligned_bound(dim, 128))
+        elif dim > 32:
+            result.append(compute_next_aligned_bound(dim, 32))
+        else:
+            result.append(dim)
+
+    return result
+
+
+def calculate_padded_dimensions(
+    M: list[int],
+    N: list[int],
+    contraction_dims: ContractionDimensions,
+    contraction_maps: list[ir.AffineMap],
+) -> tuple[list[int], list[int], bool]:
+    """Calculates padded M and N dimensions for matmul operations.
+
+    Returns:
+        A tuple of (M_padded, N_padded, any_padding_applied) where:
+        - M_padded: Padded M dimensions.
+        - N_padded: Padded N dimensions.
+        - any_padding_applied: True if any padding was applied to M or N, False otherwise.
+    """
+    # Detect LHS transposition. Padding is disabled only when LHS is transposed.
+    k_dim_inner = contraction_dims.k[-1]
+    lhs_map = contraction_maps[0]
+    lhs_last_expr = lhs_map.results[-1]
+    lhs_dim_expr = ir.AffineDimExpr(lhs_last_expr)
+
+    transposed_lhs = k_dim_inner != lhs_dim_expr.position
+
+    M_padded = get_dim_bounds(M, transposed_lhs)
+    N_padded = get_dim_bounds(N, transposed_lhs)
+
+    any_padding_applied = M_padded != M or N_padded != N
+    return M_padded, N_padded, any_padding_applied
+
+
+class KnobSymbols(dict[str, z3.ExprRef]):
+    """Maps knob names to z3 symbolic constants (pre-solving)."""
+
+    pass
+
+
+class SMTKnobAssignment(dict[str, int]):
+    """Maps knob names to integer values (post-solving)."""
+
+    # TODO(Amily): temporarily named `SMTKnobAssignment` to avoid confusion
+    # with `KnobAssignment`. Rename after constraints are refactored.
+
+    pass
+
+
+_AttrT = TypeVar("_AttrT", bound=ir.Attribute)
+
+
+@dataclass(frozen=True, slots=True)
+class AttrKey(Generic[_AttrT]):
+    """A compilation info dictionary key with its expected MLIR attribute type."""
+
+    name: str
+    attr_type: type[_AttrT]
+
+
+class CompilationInfoBuilder(ABC):
+    """Abstract base for building iree_codegen.CompilationInfoAttr.
+
+    Each backend subclass converts a ConstraintsOp and its SMT solver knob
+    assignments into a CompilationInfoAttr. The inner LoweringConfig and
+    TranslationInfo classes declare AttrKey constants that map MLIR attribute
+    key names to their expected ir attribute types.
+
+    For example, given a ConstraintsOp for GPU backend with:
+        knobs = {workgroup = #iree_codegen.smt.int_knob<"wg_m">}
+
+    The LoweringConfig subclass should declare:
+        WORKGROUP: AttrKey[ir.ArrayAttr] = AttrKey("workgroup", ir.ArrayAttr)
+    """
+
+    class LoweringConfig(ABC):
+        """Key names for the backend's lowering config attribute dictionary."""
+
+        pass
+
+    class TranslationInfo(ABC):
+        """Key names for the backend's translation info attribute fields."""
+
+        pass
+
+    @classmethod
+    @abstractmethod
+    def build_compilation_info_attr(
+        cls,
+        constraints_op: iree_codegen.ConstraintsOp,
+        knob_assignment: SMTKnobAssignment,
+    ) -> iree_codegen.CompilationInfoAttr:
+        ...

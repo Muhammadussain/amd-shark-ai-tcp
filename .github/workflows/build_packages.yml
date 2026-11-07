@@ -1,0 +1,208 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: Build packages
+
+on:
+  # Trigger from another workflow (typically to build dev packages and then test them)
+  workflow_call:
+    inputs:
+      build_type:
+        description: The type of build version to produce ("stable", "rc", or "dev")
+        type: string
+        default: "dev"
+  # Trigger manually (typically to test the workflow or manually build a release [candidate])
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: The type of build version to produce ("stable", "rc", or "dev")
+        type: string
+        default: "rc"
+  # Trigger on a schedule to build nightly release candidates.
+  schedule:
+    # Runs at 11:00 AM UTC, which is 3:00 AM PST (UTC-8)
+    - cron: '0 11 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  # Generate metadata on Linux and pass to later jobs.
+  setup_metadata:
+    if: ${{ github.repository_owner == 'nod-ai' || github.event_name != 'schedule' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      version_suffix: ${{ steps.version_local.outputs.version_suffix }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Setup Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: 3.12
+
+      - name: Install Python packages
+        run: pip install packaging
+
+      # Compute version suffix based on inputs (default to 'rc')
+      - name: Compute stable version suffix
+        if: ${{ inputs.build_type == 'stable' }}
+        run: |
+          version_suffix=""
+          echo "version_suffix=${version_suffix}" >> $GITHUB_ENV
+      - name: Compute rc version suffix
+        if: ${{ inputs.build_type == 'rc' || inputs.build_type == '' }}
+        run: |
+          version_suffix="$(printf 'rc%(%Y%m%d)T')"
+          echo "version_suffix=${version_suffix}" >> $GITHUB_ENV
+      - name: Compute dev version suffix
+        if: ${{ inputs.build_type == 'dev' }}
+        run: |
+          version_suffix=".dev0+${{ github.sha }}"
+          echo "version_suffix=${version_suffix}" >> $GITHUB_ENV
+
+      - name: Write version local files
+        id: version_local
+        run: |
+          echo "version_suffix=${version_suffix}" >> $GITHUB_OUTPUT
+          # python3 build_tools/python_deploy/compute_local_version.py --version-suffix=${version_suffix} --write-json amdsharktank
+          python3 build_tools/python_deploy/compute_local_version.py --version-suffix=${version_suffix} --write-json amdsharktuner
+          # python3 build_tools/python_deploy/compute_local_version.py --version-suffix=${version_suffix} --write-json shortfin
+          python3 build_tools/python_deploy/compute_common_version.py --version-suffix=${version_suffix} --write-json
+
+      - name: Upload version_local.json files
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: version_local_files
+          path: |
+            # amdsharktank/version_local.json
+            amdsharktuner/version_local.json
+            # shortfin/version_local.json
+            amdshark-ai/version_local.json
+
+  build_packages:
+    name: "${{ matrix.package }} :: ${{ matrix.platform }} :: ${{ matrix.python-version }}"
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: write
+    needs: [setup_metadata]
+    env:
+      OUTPUT_DIR: "${{ github.workspace }}/bindist"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu packages.
+          - runs-on: ubuntu-24.04
+            platform: linux-x86_64
+            package: amdshark-ai
+            python-version: cp311-cp311  # Ignored (generic wheel), set for workflow naming
+          # - runs-on: ubuntu-24.04
+          #   platform: linux-x86_64
+          #   package: amdsharktank
+          #   python-version: cp311-cp311  # Ignored (generic wheel), set for workflow naming
+          - runs-on: ubuntu-24.04
+            platform: linux-x86_64
+            package: amdsharktuner
+            python-version: cp311-cp311  # Ignored (generic wheel), set for workflow naming
+          # - runs-on: ubuntu-24.04
+          #   platform: linux-x86_64
+          #   package: shortfin
+          #   python-version: cp310-cp310
+          # - runs-on: ubuntu-24.04
+          #   platform: linux-x86_64
+          #   package: shortfin
+          #   python-version: cp311-cp311
+          # - runs-on: ubuntu-24.04
+          #   platform: linux-x86_64
+          #   package: shortfin
+          #   python-version: cp312-cp312
+          # - runs-on: ubuntu-24.04
+          #   platform: linux-x86_64
+          #   package: shortfin
+          #   python-version: cp313-cp313
+          # - runs-on: ubuntu-24.04
+          #   platform: linux-x86_64
+          #   package: shortfin
+          #   python-version: cp313-cp313t
+
+          # TODO(#130): macOS platform
+          # TODO(#130): Windows platform
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      with:
+        path: "c" # Windows can hit path length limits, so use a short path.
+        submodules: false
+
+    - name: Download version_local.json files
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      with:
+        name: version_local_files
+        path: ./c/
+        merge-multiple: true
+
+    # Dev builds can use a cache and disable tracing to halve the build time.
+    # Other build use no cache for supply chain security and keep tracing enabled.
+    - name: Apply dev settings
+      if: ${{ inputs.build_type == 'dev' }}
+      run: |
+        echo "CACHE_DIR=${{ github.workspace }}/.amdshark-ai-cache" >> $GITHUB_ENV
+        echo "SHORTFIN_ENABLE_TRACING=OFF" >> $GITHUB_ENV
+    - name: Setup cache
+      if: ${{ inputs.build_type == 'dev' }}
+      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ${{ env.CACHE_DIR }}
+        key: build-packages-${{ matrix.package }}-${{ matrix.platform }}-${{ matrix.python-version }}-v1-${{ github.sha }}
+        restore-keys: |
+          build-packages-${{ matrix.package }}-${{ matrix.platform }}-${{ matrix.python-version }}-v1-
+
+    # Build packages.
+    - name: Build amdshark-ai (Linux x86_64)
+      if: "matrix.package == 'amdshark-ai' && matrix.platform == 'linux-x86_64'"
+      run: |
+        [ -e ./bindist/* ] && rm ./bindist/*
+        ./c/build_tools/python_deploy/write_requirements.py --version-suffix=${{ needs.setup_metadata.outputs.version_suffix }}
+        ./c/amdshark-ai/build_tools/build_linux_package.sh
+    # - name: Build amdsharktank (Linux x86_64)
+    #   if: "matrix.package == 'amdsharktank' && matrix.platform == 'linux-x86_64'"
+    #   run: |
+    #     [ -e ./bindist/* ] && rm ./bindist/*
+    #     ./c/amdsharktank/build_tools/build_linux_package.sh
+    - name: Build amdsharktuner (Linux x86_64)
+      if: "matrix.package == 'amdsharktuner' && matrix.platform == 'linux-x86_64'"
+      run: |
+        [ -e ./bindist/* ] && rm ./bindist/*
+        bash ./c/amdsharktuner/build_tools/build_linux_package.sh
+    # - name: Build shortfin (Linux x86_64, ${{ matrix.python-version }})
+    #   if: "matrix.package == 'shortfin' && matrix.platform == 'linux-x86_64'"
+    #   env:
+    #     OVERRIDE_PYTHON_VERSIONS: "${{ matrix.python-version }}"
+    #   run: |
+    #     [ -e ./bindist/* ] && rm ./bindist/*
+    #     ./c/shortfin/build_tools/build_linux_package.sh
+
+    # Always upload to GitHub artifacts.
+    - name: Upload python wheels
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      with:
+        if-no-files-found: error
+        name: snapshot-${{ matrix.package }}-${{ matrix.platform }}-${{ matrix.python-version }}
+        path: bindist
+    # Upload release candidate versions to a 'dev-wheels' GitHub release.
+    - name: Release rc python wheels
+      if: ${{ inputs.build_type == 'rc' || inputs.build_type == '' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        artifacts: bindist/*.whl
+        tag: "dev-wheels"
+        name: "dev-wheels"
+        body: "Automatic snapshot release of amdshark-ai python wheels."
+        removeArtifacts: false
+        allowUpdates: true
+        replacesArtifacts: true
+        makeLatest: false

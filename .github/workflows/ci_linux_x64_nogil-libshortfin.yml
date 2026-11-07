@@ -1,0 +1,80 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: CI - shortfin - Python 3.13 Free-threaded
+
+on:
+  workflow_dispatch:
+  # pull_request:
+  #   paths:
+  #     - '.github/workflows/ci_linux_x64_nogil-libshortfin.yml'
+  #     - 'shortfin/**'
+
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - '.github/workflows/ci_linux_x64_nogil-libshortfin.yml'
+  #     - 'shortfin/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  LIBSHORTFIN_DIR: ${{ github.workspace }}/shortfin/
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install clang lld cmake ninja-build
+
+    - name: Setup Python
+      uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+      with:
+        python-version: "3.13t"
+    - name: Install Python packages
+      run: |
+        pip install -r ${{ env.LIBSHORTFIN_DIR }}/requirements-tests-nogil.txt
+        pip freeze
+
+    - name: Build shortfin (full)
+      working-directory: ${{ env.LIBSHORTFIN_DIR }}
+      run: |
+        mkdir build
+        cmake -GNinja \
+          -S. \
+          -Bbuild \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_COMPILER=clang-18 \
+          -DCMAKE_CXX_COMPILER=clang++-18 \
+          -DCMAKE_LINKER_TYPE=LLD \
+          -DSHORTFIN_BUNDLE_DEPS=ON \
+          -DSHORTFIN_BUILD_PYTHON_BINDINGS=ON
+        cmake --build build --target all
+        pip install -v -e build/
+
+    - name: Run shortfin Python tests (full)
+      working-directory: ${{ env.LIBSHORTFIN_DIR }}
+      run: |
+        pytest -s --ignore=tests/examples/fastapi_test.py --ignore=tests/apps/sd --ignore=tests/apps/flux --ignore=tests/interop
+      # TODO: Enable further tests and switch to
+      # pytest -s

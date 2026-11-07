@@ -1,0 +1,78 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: CI - amdsharktank perplexity short
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test_perplexity:
+    name: "Perplexity tests"
+    strategy:
+      matrix:
+        python-version: [3.11]
+        torch-version: ["2.6.0"]
+        runs-on: [linux-mi325-1gpu-ossci-nod-ai]
+      fail-fast: false
+    runs-on: ${{matrix.runs-on}}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VENV_DIR: ${{ github.workspace }}/.venv
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: "Setting up Python"
+        id: setup_python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: ${{matrix.python-version}}
+      - name: Create Python venv
+        run: python -m venv ${VENV_DIR}
+
+      - name: Install amdsharktank deps
+        run: |
+          source ${VENV_DIR}/bin/activate
+          amdsharktank/build_tools/install_test_dependencies.sh \
+            --torch-version ${{matrix.torch-version}} \
+            --pytorch-rocm
+          pip freeze
+
+      - name: Run Perplexity tests
+        run: |
+          source ${VENV_DIR}/bin/activate
+          mkdir perplexity_ci_artifacts
+          python -m amdsharktank.models.deepseek.toy_deepseek -o "perplexity_ci_artifacts/toy_deepseek.irpa"
+          pytest \
+            -n 8 \
+            -v \
+            -s \
+            amdsharktank/tests/evaluate/ \
+            --run-quick-test \
+            --bs=4 \
+            --device='cuda:0' \
+            --iree-device=hip://0 \
+            --iree-rocm-target=gfx942 \
+            --iree-hal-target-device=hip \
+            --llama3-8b-f16-model-path=/amdshark-dev/ossci-models/llama_3_1/8b/fp16/llama_3_1_instruct_8b_fp16.irpa \
+            --llama3-8b-f8-model-path=/amdshark-dev/ossci-models/llama_3_1/instruct_8b_fp8_e4m3fnuz.irpa \
+            --llama3-8b-tokenizer-path=/amdshark-dev/ossci-models/llama_3_1/8b/tokenizer/tokenizer_config.json \
+            --log-cli-level=INFO
+          ls -lha ${{ github.workspace }}/perplexity_ci_artifacts

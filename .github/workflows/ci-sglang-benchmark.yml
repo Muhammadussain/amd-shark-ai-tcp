@@ -1,0 +1,238 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# =================================== README ===================================
+# The `benchmark_sglang` job in this CI is mostly dependent on code outside
+# of the `amdshark-ai` repo itself. By including it here, we are able to maintain
+# an apples-to-apples comparison between shortfin and SGLang performance in a
+# centralized location, as we place more effort in shortfin LLM performance, and
+# WHILE WE WORK TOWARDS A BETTER ALTERNATIVE.
+
+# We should not be generally repeating this pattern, and should never repeat
+# this pattern outside of specifically benchmarking shortfin apps against
+# external projects, as part of an organized and clearly defined effort.
+# ==============================================================================
+
+name: SGLang Llama Benchmarking Tests
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   # Weekdays at 11:00 AM UTC = 03:00 AM PST / 04:00 AM PDT
+  #   - cron: "0 11 * * 1-5"
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark_shortfin:
+    if: ${{ github.repository_owner == 'nod-ai' || github.event_name != 'schedule' }}
+    name: "SGLang Serving Benchmark With Shortfin"
+    strategy:
+      matrix:
+        include:
+          - name: amdgpu_rocm_mi325_gfx942
+            runs-on: linux-mi325-1gpu-ossci-nod-ai
+            test_device: gfx942
+            python-version: 3.11
+      fail-fast: false
+    runs-on: ${{ matrix.runs-on }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VENV_DIR: ${{ github.workspace }}/.venv
+    steps:
+      - name: Run rocminfo
+        if: contains(matrix.test_device, 'gfx')
+        run: rocminfo
+      - name: "Checkout Code"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: "Setting up Python"
+        id: setup_python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: ${{matrix.python-version}}
+      - name: Create Python venv
+        run: python -m venv ${VENV_DIR}
+
+      - name: Install pip deps
+        run: |
+          source ${VENV_DIR}/bin/activate
+          python -m pip install --no-compile --upgrade pip
+
+          # Note: We install in three steps in order to satisfy requirements
+          # from non default locations first.
+          pip install --no-compile -r pytorch-cpu-requirements.txt
+
+          # Use newest possible releases to be able to track commits that may
+          # cause errors or performance changes.
+          pip install -r requirements-iree-unpinned.txt
+
+          pip install --no-compile \
+            -r amdsharktank/requirements-tests.txt \
+            -r shortfin/requirements-tests.txt \
+            -e amdsharktank/ shortfin/
+
+          # Install SGLang
+          pip install "git+https://github.com/nod-ai/sglang.git#subdirectory=python"
+
+          pip freeze
+
+      - name: Login to huggingface
+        continue-on-error: true
+        run: |
+          pip install -U "huggingface_hub[cli]"
+          huggingface-cli login --token ${{ secrets.HF_TOKEN }}
+
+      - name: Run Shortfin Benchmark Tests
+        run: |
+          source ${VENV_DIR}/bin/activate
+          pytest -v --test_device=${{ matrix.test_device }} app_tests/benchmark_tests/llm/sglang_benchmarks/shortfin_benchmark_test.py --log-cli-level=INFO --html=shortfin_index.html --self-contained-html
+
+      - name: Upload pytest report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: shortfin_benchmark
+          path: shortfin_index.html
+
+  benchmark_sglang:
+    name: "SGLang Serving Benchmark With SGLang"
+    strategy:
+      matrix:
+        version: [3.11]
+      fail-fast: false
+    runs-on: linux-mi325-1gpu-ossci-nod-ai
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: "Setting up Python"
+        id: setup_python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: ${{matrix.version}}
+
+      - name: Install deps
+        run: |
+          python -m pip install --no-compile --upgrade pip
+
+          pip install "git+https://github.com/nod-ai/sglang.git#subdirectory=python"
+
+          pip install pytest
+
+          # Use newest possible releases to be able to track commits that may
+          # cause errors or performance changes.
+          pip install -r requirements-iree-unpinned.txt
+
+          pip install --no-compile \
+            -r amdsharktank/requirements-tests.txt \
+            -r shortfin/requirements-tests.txt \
+            -e amdsharktank/ shortfin/
+
+          pip freeze
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Instruction for SGLang image sourced from here:
+      #   https://sgl-project.github.io/start/install.html#method-3-using-docker
+      # We have to run in a docker container due to their vLLM dependency.
+      # From their pyproject.toml:
+      #   HIP (Heterogeneous-computing Interface for Portability) for AMD
+      #   => base docker rocm/vllm-dev:20241022, not from public vllm whl
+      #   srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.3.dev13"]
+      - name: Pull SGLang Image (Had issues with sglang:v0.3.5.post2-rocm620)
+        run: |
+          docker pull lmsysorg/sglang:v0.3.5.post1-rocm620
+
+      - name: Run SGLang Server
+        run: |
+          docker run --rm -d  \
+            --name=sglang-server \
+            --device=/dev/kfd \
+            --device=/dev/dri \
+            --ipc=host \
+            --shm-size 16G \
+            --group-add video \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -v $HOME/dockerx:/dockerx \
+            -v /data:/data \
+            -p 30000:30000 \
+            -v ~/.cache/huggingface:/root/.cache/huggingface \
+            --env HF_TOKEN=${{ secrets.HF_TOKEN }} \
+            lmsysorg/sglang:v0.3.5.post1-rocm620 \
+            python3 -m sglang.launch_server \
+            --model-path meta-llama/Llama-3.1-8B-Instruct \
+            --host 0.0.0.0 \
+            --port 30000 \
+            --tp 1 \
+            --dtype float16 \
+            --disable-cuda-graph
+
+      - name: Run SGLang Benchmark Tests
+        run: |
+          pytest -v app_tests/benchmark_tests/llm/sglang_benchmarks/sglang_benchmark_test.py --port 30000 --log-cli-level=INFO --html=sglang_index.html --self-contained-html
+
+      - name: Upload pytest report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: sglang_benchmark
+          path: sglang_index.html
+
+  merge_and_upload_reports:
+    name: "Merge and upload benchmark reports"
+    needs: [benchmark_shortfin, benchmark_sglang]
+    if: needs.benchmark_shortfin.result == 'success' || needs.benchmark_sglang.result == 'success'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: "Setting up Python"
+        id: setup_python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: 3.11
+
+      - name: Install pytest-html-merger
+        run: pip install pytest-html-merger
+
+      - name: Download shortfin report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: shortfin_benchmark
+          path: reports
+        continue-on-error: true
+
+      - name: Download sglang report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: sglang_benchmark
+          path: reports
+        continue-on-error: true
+
+      - name: Merge html reports
+        run: |
+          mkdir merged_reports
+          pytest_html_merger -i reports -o merged_reports/index.html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.AMD_SHARK_AI_GITHUB_TOKEN }}
+          publish_dir: merged_reports
+          destination_dir: ./llm/sglang
+          keep_files: true

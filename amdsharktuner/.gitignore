@@ -1,0 +1,8 @@
+.venv/
+
+# Tuning artifacts.
+tuning_*/
+boo_tuning_*/
+boo_tuner/boo_turbine_cache_*/
+fusilli_tuning_*/
+fusilli_tuner/fusilli_cache_*/
