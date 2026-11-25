@@ -471,35 +471,24 @@ class BlockScaledQ5_0Layout(QuantizedLayout):
     def qs(self) -> torch.Tensor:
         return self._qs
 
-    # def unpack_q(self) -> torch.Tensor:
-    #     """Logical 5-bit values (0..31) as int32 `[..., K // 32, 32]`."""
-    #     qs = self._qs
-    #     qh = self._qh
-    #     if qs.dtype == torch.int8:
-    #         qs = qs.view(torch.uint8)
-    #     if qh.dtype == torch.int8:
-    #         qh = qh.view(torch.uint8)
-    #     qs = qs.to(torch.int32)
-    #     qh = qh.to(torch.int32)
-    #     # Elements 0..15 are the low nibbles, 16..31 the high nibbles.
-    #     low4 = torch.cat([qs & 0xF, (qs >> 4) & 0xF], dim=-1)
-    #     # Bit j of the little endian uint32 == byte (j // 8), bit (j % 8).
-    #     shifts = torch.arange(8, dtype=torch.int32)
-    #     high_bit = ((qh.unsqueeze(-1) >> shifts) & 1).flatten(-2)
-    #     return low4 | (high_bit << 4)
     def unpack_q(self) -> torch.Tensor:
+        """Returns the logical 5-bit values (0..31) as int32 `[..., K // 32, 32]`."""
         qs = self._qs
-        qh = self._qh     
+        qh = self._qh
         if qs.dtype == torch.int8:
             qs = qs.view(torch.uint8)
         if qh.dtype == torch.int8:
             qh = qh.view(torch.uint8)
         qs = qs.to(torch.int32)
-        qh = qh.to(torch.int32) // qs0= qs[0],qs[16],
+        qh = qh.to(torch.int32)
+        # Elements 0..15 are the low nibbles, 16..31 the high nibbles.
         low4 = torch.cat([qs & 0xF, torch.div(qs, 16, rounding_mode="floor")], dim=-1)
-        pow2 = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.int32)
-        high_bit = (torch.div(qh.unsqueeze(-1), pow2, rounding_mode="floor") % 2).flatten(-2)
+        # Bit j of the little endian uint32 == byte (j // 8), bit (j % 8).
+        # The shift amount b is a Python int, not a tensor, so this lowers
+        # through torch-mlir.
+        high_bit = torch.stack([(qh >> b) & 1 for b in range(8)], dim=-1).flatten(-2)
         return low4 | (high_bit * 16)
+  
     
     def dequant(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         return self.dequant_blocked(dtype).reshape(self.shape)

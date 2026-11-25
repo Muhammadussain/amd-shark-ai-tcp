@@ -78,7 +78,8 @@ util.func private @amdsharktank_mmt_block_scaled_q5_0_tiled_3d_{{n}}_{{k}}_{{m0}
   %qh_dest = tensor.empty() : tensor<{{n1}}x{{k1}}x{{n0}}x{{kb * 4}}xi8>
   %qh_pack = linalg.pack %qh2 padding_value(%zero_i8 : i8)
       inner_dims_pos = [0, 1] inner_tiles = [{{n0}}, {{kb * 4}}] into %qh_dest
-      : tensor<{{n}}x{{group0 * 4}}xi8> -> tensor<{{n1}}x{{k1}}x{{n0}}x{{kb * 4}}xi8>
+      : tensor<{{n}}x{{group0 * 4}}xi8> -> tensor<{{n1}}x{{k1
+      }}x{{n0}}x{{kb * 4}}xi8>
 
   %qs_dest = tensor.empty() : tensor<{{n1}}x{{k1}}x{{n0}}x{{kb * 16}}xi8>
   %qs_pack = linalg.pack %qs2 padding_value(%zero_i8 : i8)
@@ -97,7 +98,7 @@ util.func private @amdsharktank_mmt_block_scaled_q5_0_tiled_3d_{{n}}_{{k}}_{{m0}
           affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d4, d5 floordiv 8)>,
           affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d4, (d5 floordiv 32) * 16 + d5 mod 16)>,
           affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d3, d4)>],
-      iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"] }
+      iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]}
       ins(%a_pack, %d_pack, %qh_pack, %qs_pack
           : tensor<?x{{k1}}x{{m0}}x{{k0}}x!a_type>,
             tensor<{{n1}}x{{k1}}x{{n0}}x{{kb}}x!scale_type>,
@@ -108,15 +109,15 @@ util.func private @amdsharktank_mmt_block_scaled_q5_0_tiled_3d_{{n}}_{{k}}_{{m0}
       %kk = linalg.index 5 : index
       %kk_i32 = arith.index_cast %kk : index to i32
       %c1_i32 = arith.constant 1 : i32
+      %c2_i32 = arith.constant 2 : i32       
       %c4_i32 = arith.constant 4 : i32
       %c7_i32 = arith.constant 7 : i32
       %c15_i32 = arith.constant 15 : i32
       %c16_i32 = arith.constant 16 : i32
+      // nibble = (extui(qs) >> shift) & 15   // shift = (kk >> 2) & 4   (0 for weights 0..15, 4 for weights 16..31)
 
-      // Low nibble: element j = kk mod 32; j < 16 -> low nibble, j >= 16 -> high.
-      %hsel = arith.shrui %kk_i32, %c4_i32 : i32
-      %h = arith.andi %hsel, %c1_i32 : i32
-      %nib_shift = arith.muli %h, %c4_i32 : i32
+      %t = arith.shrui %kk_i32, %c2_i32 : i32
+      %nib_shift = arith.andi %t, %c4_i32 : i32
       %qs_i32 = arith.extui %qs_element : i8 to i32
       %qs_shifted = arith.shrui %qs_i32, %nib_shift : i32
       %low4 = arith.andi %qs_shifted, %c15_i32 : i32
@@ -136,6 +137,7 @@ util.func private @amdsharktank_mmt_block_scaled_q5_0_tiled_3d_{{n}}_{{k}}_{{m0}
     {% else %}
       %d_f32 = arith.extf %d_element : !scale_type to !accum_type
     {% endif %}
+     
       %w = arith.mulf %q_fp, %d_f32 : !accum_type
 
     {% if a_type == accum_type %}

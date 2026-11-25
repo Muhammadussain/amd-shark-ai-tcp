@@ -27,7 +27,7 @@ def _planes(n, k, seed=0):
 class mmt_block_scaled_q5_0_tiled_test(unittest.TestCase):
     @parameterized.expand(
         [
-            # (m0, n0, k0): includes tiles that do not divide M, N or K.
+            # (m0, n0, k0)
             (1, 1, 32),
             (4, 8, 32),
         ]
